@@ -3,11 +3,19 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>dsh-handtrack - 3D Hand Tracking Demo</title>
+  <title>dsh-handtrack - 3D Hand Tracking</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { background: #050510; overflow: hidden; font-family: Consolas, monospace; }
     #canvas { display: block; width: 100vw; height: 100vh; }
+    #video {
+      position: fixed; bottom: 20px; left: 20px;
+      width: 320px; height: 240px;
+      border-radius: 8px; opacity: 0.9;
+      z-index: 10; pointer-events: none;
+      transform: scaleX(-1);
+      border: 2px solid rgba(0,255,136,0.3);
+    }
     #hud {
       position: fixed; top: 10px; right: 10px;
       color: #0f8; font-size: 12px;
@@ -19,29 +27,33 @@
     #hud .status { font-size: 14px; font-weight: bold; margin-bottom: 4px; }
     #hud .fps { color: #888; font-size: 11px; }
     #hud .tips { color: #666; font-size: 10px; margin-top: 10px; line-height: 1.6; }
-    #error-msg {
-      display: none;
-      position: fixed; bottom: 20px; left: 50%;
-      transform: translateX(-50%);
-      background: rgba(200,50,50,0.9); color: #fff;
-      padding: 12px 20px; border-radius: 8px;
-      font-size: 13px; max-width: 600px; z-index: 200;
+    #loading {
+      position: fixed; top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      color: #0f8; font-size: 18px; z-index: 100;
       text-align: center;
     }
+    #loading .dot { animation: blink 1s infinite; }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
   </style>
 </head>
 <body>
+  <video id="video" autoplay playsinline muted></video>
   <canvas id="canvas"></canvas>
   <div id="hud">
-    <div class="status" id="status">DEMO MODE</div>
+    <div class="status" id="status">LOADING...</div>
     <div class="fps" id="fps">FPS: --</div>
-    <div class="tips">drag: orbit | scroll: zoom<br>模拟手部动作中...</div>
+    <div class="tips">drag: orbit | scroll: zoom</div>
   </div>
-  <div id="error-msg"></div>
+  <div id="loading">Loading Three.js + HandTrack<span class="dot">...</span></div>
 
   <!-- Three.js -->
   <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
-  
+  <!-- TensorFlow.js -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+  <!-- HandTrack -->
+  <script src="https://cdn.jsdelivr.net/npm/handtrackjs@0.1.0/dist/handtrack.min.js"></script>
+
   <script>
     // ── Config ───────────────────────────────────────────────────────────────
     const ROBOT_JOINTS = {
@@ -55,9 +67,10 @@
     let isDragging = false, lastMX = 0, lastMY = 0
     let t = 0
 
-    // Demo hand positions (animated)
-    const demoHand = []
-    for (let i = 0; i < 21; i++) demoHand.push([0,0,0])
+    const STATUS_EL = document.getElementById('status')
+    const FPS_EL = document.getElementById('fps')
+    const LOADING_EL = document.getElementById('loading')
+    const VIDEO_EL = document.getElementById('video')
 
     // ── Three.js scene ───────────────────────────────────────────────────────
     const scene = new THREE.Scene()
@@ -102,7 +115,7 @@
       scene.add(m); robotMeshes[k] = m
     }
 
-    // String lines
+    // String lines (finger tip -> robot joint)
     const stringLines = []
     for (let f = 0; f < 5; f++) {
       const pts = new Float32Array(6)
@@ -111,24 +124,6 @@
       const l = new THREE.Line(g, new THREE.LineBasicMaterial({color: new THREE.Color(c[0],c[1],c[2]), transparent:true, opacity:0.7}))
       l.visible = false; scene.add(l); stringLines.push(l)
     }
-
-    // Hand skeleton (21 landmarks)
-    const hp = new Float32Array(21*3)
-    const handLine = new THREE.Line(
-      new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(hp,3)),
-      new THREE.LineBasicMaterial({color:0x00ffaa})
-    )
-    handLine.visible = true; scene.add(handLine)
-
-    // Bone pairs
-    const bones = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[12,13],[13,14],[14,15],[15,16],[12,17],[17,18],[18,19],[19,20],[5,9],[9,13],[13,17]]
-    const bp = []
-    for (const [a,b] of bones) { bp.push(hp[a*3],hp[a*3+1],hp[a*3+2],hp[b*3],hp[b*3+1],hp[b*3+2]) }
-    const boneLine = new THREE.LineSegments(
-      new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute(bp,3)),
-      new THREE.LineBasicMaterial({color:0x00aa66, transparent:true, opacity:0.5})
-    )
-    boneLine.visible = true; scene.add(boneLine)
 
     // ── Mouse controls ───────────────────────────────────────────────────────
     const canvas = document.getElementById('canvas')
@@ -152,49 +147,112 @@
       renderer.setSize(innerWidth, innerHeight)
     })
 
-    // ── Animation ────────────────────────────────────────────────────────────
-    const clock = new THREE.Clock()
-    let fpsCnt=0, fpsTime=0
+    // ── HandTrack setup ──────────────────────────────────────────────────────
+    let model = null
+    let predictedPositions = [] // Array of [x,y,w,h] per detection
+    let fpsCnt = 0, fpsTime = 0
 
+    async function start() {
+      try {
+        // Start camera
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: 640, height: 480, facingMode: 'user' }
+        })
+        VIDEO_EL.srcObject = stream
+        await VIDEO_EL.play()
+        
+        STATUS_EL.textContent = 'Loading model...'
+        STATUS_EL.style.color = '#ff8'
+        
+        // Load HandTrack model
+        model = await handtrack.load(0.5, 0.3)
+        STATUS_EL.textContent = 'Starting detection...'
+        
+        // Start predicting
+        handtrack.startVideo(VIDEO_EL, 640, 480)
+        handtrack.onPrediction((results) => {
+          predictedPositions = results
+          updateHUD(results)
+        })
+        
+        LOADING_EL.style.display = 'none'
+        STATUS_EL.textContent = 'AI AGENT: ACTIVE'
+        STATUS_EL.style.color = '#0f8'
+        
+        animate()
+        
+      } catch(e) {
+        console.error('[handtrack] Error:', e)
+        LOADING_EL.textContent = 'ERROR: ' + e.message
+        STATUS_EL.textContent = 'ERROR'
+        STATUS_EL.style.color = '#f33'
+      }
+    }
+
+    function updateHUD(results) {
+      if (results.length > 0) {
+        STATUS_EL.textContent = 'HAND DETECTED'
+        STATUS_EL.style.color = '#0f8'
+      } else {
+        STATUS_EL.textContent = 'AI AGENT: STANDBY'
+        STATUS_EL.style.color = '#f80'
+      }
+    }
+
+    // ── Animation loop ───────────────────────────────────────────────────────
     function animate() {
       requestAnimationFrame(animate)
-      const dt = clock.getDelta()
+      const dt = 0.016
       t += dt
 
       // FPS
       fpsCnt++; fpsTime += dt
       if (fpsTime >= 1) { 
-        document.getElementById('fps').textContent = 'FPS: '+fpsCnt 
-        fpsCnt=0; fpsTime=0 
+        FPS_EL.textContent = 'FPS: ' + fpsCnt 
+        fpsCnt = 0; fpsTime = 0 
       }
 
-      // Demo hand animation (wave motion)
-      for (let i = 0; i < 21; i++) {
-        const baseX = (i % 5) * 0.4 - 0.8
-        const baseY = 0.5 + Math.floor(i / 5) * 0.3
-        demoHand[i][0] = baseX + Math.sin(t*2 + i*0.3) * 0.2
-        demoHand[i][1] = baseY + Math.sin(t*3 + i*0.2) * 0.1
-        demoHand[i][2] = Math.sin(t*1.5 + i*0.1) * 0.3
-      }
+      // Clear string lines
+      for (const l of stringLines) l.visible = false
 
-      // Update hand skeleton
-      for (let i = 0; i < 21; i++) {
-        hp[i*3]=demoHand[i][0]*4
-        hp[i*3+1]=demoHand[i][1]*3
-        hp[i*3+2]=demoHand[i][2]*2
-      }
-      handLine.geometry.attributes.position.needsUpdate = true
-
-      // Update strings
-      const fingerTips = [4, 8, 12, 16, 20]
-      for (let f = 0; f < 5; f++) {
-        const tip = demoHand[fingerTips[f]]
-        const jp = ROBOT_JOINTS[FINGER_JOINT[f]]
-        const pos = stringLines[f].geometry.attributes.position.array
-        pos[0]=tip[0]*4; pos[1]=tip[1]*3; pos[2]=tip[2]*2
-        pos[3]=jp[0]; pos[4]=jp[1]; pos[5]=jp[2]
-        stringLines[f].geometry.attributes.position.needsUpdate = true
-        stringLines[f].visible = true
+      // Update strings based on predictions
+      if (predictedPositions.length > 0) {
+        const det = predictedPositions[0]
+        const [x, y, w, h] = det
+        
+        // Map detection position to 3D space
+        const hand3D = [
+          (x / 640) * 4 - 2,  // x
+          (y / 480) * 3 - 1.5, // y
+          -0.5  // z (fixed depth)
+        ]
+        
+        // Update strings for each finger
+        for (let f = 0; f < 5; f++) {
+          const jp = ROBOT_JOINTS[FINGER_JOINT[f]]
+          const pos = stringLines[f].geometry.attributes.position.array
+          // Finger tip offset from detection center
+          const fx = hand3D[0] + (f - 2) * 0.3
+          const fy = hand3D[1] + 0.3
+          const fz = hand3D[2]
+          pos[0] = fx; pos[1] = fy; pos[2] = fz
+          pos[3] = jp[0]; pos[4] = jp[1]; pos[5] = jp[2]
+          stringLines[f].geometry.attributes.position.needsUpdate = true
+          stringLines[f].visible = true
+        }
+      } else {
+        // Demo mode: animate a fake hand
+        for (let f = 0; f < 5; f++) {
+          const jp = ROBOT_JOINTS[FINGER_JOINT[f]]
+          const pos = stringLines[f].geometry.attributes.position.array
+          const wave = Math.sin(t * 2 + f * 0.5) * 0.5
+          pos[0] = wave
+          pos[1] = 0.5 + f * 0.2
+          pos[2] = -0.5
+          pos[3] = jp[0]; pos[4] = jp[1]; pos[5] = jp[2]
+          stringLines[f].geometry.attributes.position.needsUpdate = true
+          stringLines[f].visible = true
+        }
       }
 
       // Idle robot animation
@@ -206,7 +264,7 @@
       renderer.render(scene, camera)
     }
 
-    animate()
+    start()
   </script>
 </body>
 </html>
