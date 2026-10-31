@@ -3,58 +3,61 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>dsh-handtrack - 3D Hand Tracking Test</title>
+  <title>dsh-handtrack - 3D Hand Tracking</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { background: #000; overflow: hidden; font-family: Consolas, monospace; }
+    body { background: #050510; overflow: hidden; font-family: Consolas, monospace; }
     #canvas { display: block; width: 100vw; height: 100vh; }
     #video { display: none; }
     #hud {
       position: fixed; top: 10px; right: 10px;
-      color: #0f8; font-size: 13px;
-      background: rgba(0,0,0,0.6);
-      padding: 8px 12px; border-radius: 6px;
+      color: #0f8; font-size: 12px;
+      background: rgba(0,0,0,0.7);
+      padding: 10px 14px; border-radius: 6px;
       z-index: 10; pointer-events: none;
-      text-align: right; min-width: 200px;
+      text-align: right; min-width: 220px;
     }
-    #hud .status { font-weight: bold; }
-    #hud .fps { color: #888; font-size: 11px; margin-top: 4px; }
-    #hud .tips { color: #aaa; font-size: 10px; margin-top: 8px; line-height: 1.6; }
-    #loading {
-      position: fixed; top: 50%; left: 50%;
-      transform: translate(-50%, -50%);
-      color: #0f8; font-size: 18px; z-index: 100;
+    #hud .status { font-size: 14px; font-weight: bold; margin-bottom: 4px; }
+    #hud .fps { color: #888; font-size: 11px; }
+    #hud .tips { color: #666; font-size: 10px; margin-top: 10px; line-height: 1.6; }
+    #error-msg {
+      display: none;
+      position: fixed; bottom: 20px; left: 50%;
+      transform: translateX(-50%);
+      background: rgba(200,50,50,0.9); color: #fff;
+      padding: 12px 20px; border-radius: 8px;
+      font-size: 13px; max-width: 600px; z-index: 200;
       text-align: center;
     }
-    #loading .dot { animation: blink 1s infinite; }
-    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
-    #error-box {
+    #fallback-overlay {
       display: none;
-      position: fixed; bottom: 20px; left: 20px;
-      background: rgba(200,0,0,0.8); color: #fff;
-      padding: 12px 16px; border-radius: 8px;
-      font-size: 12px; max-width: 500px; z-index: 200;
+      position: fixed; top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      color: #0f8; font-size: 16px;
+      text-align: center; z-index: 100;
+      background: rgba(0,0,0,0.8); padding: 30px; border-radius: 12px;
     }
   </style>
 </head>
 <body>
-  <video id="video" autoplay playsinline></video>
+  <video id="video" autoplay playsinline muted></video>
   <canvas id="canvas"></canvas>
   <div id="hud">
-    <div class="status" id="status">LOADING...</div>
+    <div class="status" id="status">INIT...</div>
     <div class="fps" id="fps">FPS: --</div>
-    <div class="tips">drag: orbit | scroll: zoom<br>needs webcam access</div>
+    <div class="tips">drag: orbit | scroll: zoom</div>
   </div>
-  <div id="loading">Loading Three.js + MediaPipe<span class="dot">...</span></div>
-  <div id="error-box"></div>
+  <div id="error-msg"></div>
+  <div id="fallback-overlay">
+    <div>Hand tracking unavailable.</div>
+    <div style="font-size:12px;color:#888;margin-top:10px">Try Chrome or Edge with camera enabled.</div>
+  </div>
 
+  <!-- Three.js -->
   <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1675466862/camera_utils.js"></script>
-
+  
   <script>
     // ── Config ───────────────────────────────────────────────────────────────
-    const W = window.innerWidth, H = window.innerHeight
     const CAM_W = 640, CAM_H = 480
     const FINGER_JOINT = ['left_shoulder','left_elbow','head','right_elbow','right_shoulder']
     const FINGER_TIP_MP = [4, 8, 12, 16, 20]
@@ -65,13 +68,14 @@
     }
     const SMOOTH_WIN = 5
     const BG = [0.02,0.02,0.05]
+
     const STATUS_EL = document.getElementById('status')
     const FPS_EL = document.getElementById('fps')
-    const LOADING_EL = document.getElementById('loading')
-    const ERROR_EL = document.getElementById('error-box')
+    const ERROR_EL = document.getElementById('error-msg')
+    const FALLBACK_EL = document.getElementById('fallback-overlay')
 
     function showError(msg) {
-      ERROR_EL.textContent = 'ERROR: ' + msg
+      ERROR_EL.textContent = msg
       ERROR_EL.style.display = 'block'
       console.error('[handtrack]', msg)
     }
@@ -82,83 +86,78 @@
     for (const k in ROBOT_JOINTS) robotJoints[k] = new Float32Array(ROBOT_JOINTS[k])
     let camAngleY = 30, camAngleX = 10, camDist = 5
     let isDragging = false, lastMX = 0, lastMY = 0
+    let handDetected = false
 
     // ── Three.js scene ───────────────────────────────────────────────────────
-    let scene, camera, renderer, clock
-    let stringLines = [], handLine, boneLine
-    let robotMeshes = {}
+    const scene = new THREE.Scene()
+    scene.background = new THREE.Color(BG[0], BG[1], BG[2])
+    scene.fog = new THREE.FogExp2(new THREE.Color(BG[0], BG[1], BG[2]), 0.04)
 
-    function initThree() {
-      scene = new THREE.Scene()
-      scene.background = new THREE.Color(BG[0], BG[1], BG[2])
-      scene.fog = new THREE.FogExp2(new THREE.Color(BG[0], BG[1], BG[2]), 0.04)
-
-      camera = new THREE.PerspectiveCamera(45, W/H, 0.1, 100)
-      renderer = new THREE.WebGLRenderer({ antialias: true, canvas: document.getElementById('canvas') })
-      renderer.setSize(W, H)
-      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
-
-      // Lights
-      scene.add(new THREE.AmbientLight(0x404060, 0.8))
-      const dir = new THREE.DirectionalLight(0xffffff, 1.2)
-      dir.position.set(3,5,4); scene.add(dir)
-      const rim = new THREE.PointLight(0x4488ff, 0.6, 10)
-      rim.position.set(-3,2,-2); scene.add(rim)
-
-      // Ground
-      const ground = new THREE.Mesh(
-        new THREE.PlaneGeometry(20,20),
-        new THREE.MeshStandardMaterial({color:0x111122, roughness:0.9})
-      )
-      ground.rotation.x = -Math.PI/2; ground.position.y = -1
-      scene.add(ground)
-      const grid = new THREE.GridHelper(20,20,0x222244,0x111133)
-      grid.position.y = -0.99; scene.add(grid)
-
-      // Robot joints
-      const geo = new THREE.SphereGeometry(0.08, 16, 16)
-      const mat = new THREE.MeshStandardMaterial({color:0x4488ff, emissive:0x2244aa, emissiveIntensity:0.3})
-      for (const k in ROBOT_JOINTS) {
-        const m = new THREE.Mesh(geo, mat.clone())
-        m.position.set(...ROBOT_JOINTS[k])
-        scene.add(m); robotMeshes[k] = m
-      }
-
-      // String lines
-      for (let f = 0; f < 5; f++) {
-        const pts = new Float32Array(6)
-        const g = new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(pts, 3))
-        const c = FINGER_COLORS[f]
-        const l = new THREE.Line(g, new THREE.LineBasicMaterial({color: new THREE.Color(c[0],c[1],c[2]), transparent:true, opacity:0.7}))
-        l.visible = false; scene.add(l); stringLines.push(l)
-      }
-
-      // Hand skeleton
-      const hp = new Float32Array(21*3)
-      handLine = new THREE.Line(
-        new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(hp,3)),
-        new THREE.LineBasicMaterial({color:0x00ffaa})
-      )
-      handLine.visible = false; scene.add(handLine)
-
-      // Bone connections
-      const bones = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[12,13],[13,14],[14,15],[15,16],[12,17],[17,18],[18,19],[19,20],[5,9],[9,13],[13,17]]
-      const bp = []
-      for (const [a,b] of bones) { bp.push(hp[a*3],hp[a*3+1],hp[a*3+2],hp[b*3],hp[b*3+1],hp[b*3+2]) }
-      boneLine = new THREE.LineSegments(
-        new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute(bp,3)),
-        new THREE.LineBasicMaterial({color:0x00aa66, transparent:true, opacity:0.5})
-      )
-      boneLine.visible = false; scene.add(boneLine)
-
-      updateCam()
-    }
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth/window.innerHeight, 0.1, 100)
+    const renderer = new THREE.WebGLRenderer({ antialias: true, canvas: document.getElementById('canvas') })
+    renderer.setSize(window.innerWidth, window.innerHeight)
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
 
     function updateCam() {
       const ry = camAngleY*Math.PI/180, rx = camAngleX*Math.PI/180
       camera.position.set(camDist*Math.sin(ry)*Math.cos(rx), camDist*Math.sin(rx)+1, camDist*Math.cos(ry)*Math.cos(rx))
       camera.lookAt(0, 0.5, 0)
     }
+    updateCam()
+
+    // Lights
+    scene.add(new THREE.AmbientLight(0x404060, 0.8))
+    const dir = new THREE.DirectionalLight(0xffffff, 1.2)
+    dir.position.set(3,5,4); scene.add(dir)
+    const rim = new THREE.PointLight(0x4488ff, 0.6, 10)
+    rim.position.set(-3,2,-2); scene.add(rim)
+
+    // Ground
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(20,20),
+      new THREE.MeshStandardMaterial({color:0x111122, roughness:0.9})
+    )
+    ground.rotation.x = -Math.PI/2; ground.position.y = -1
+    scene.add(ground)
+    scene.add(new THREE.GridHelper(20,20,0x222244,0x111133).translateY(-0.99))
+
+    // Robot joints
+    const sphereGeo = new THREE.SphereGeometry(0.08, 16, 16)
+    const bodyMat = new THREE.MeshStandardMaterial({color:0x4488ff, emissive:0x2244aa, emissiveIntensity:0.3})
+    const robotMeshes = {}
+    for (const k in ROBOT_JOINTS) {
+      const m = new THREE.Mesh(sphereGeo, bodyMat.clone())
+      m.position.set(...ROBOT_JOINTS[k])
+      scene.add(m); robotMeshes[k] = m
+    }
+
+    // String lines
+    const stringLines = []
+    for (let f = 0; f < 5; f++) {
+      const pts = new Float32Array(6)
+      const g = new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(pts, 3))
+      const c = FINGER_COLORS[f]
+      const l = new THREE.Line(g, new THREE.LineBasicMaterial({color: new THREE.Color(c[0],c[1],c[2]), transparent:true, opacity:0.7}))
+      l.visible = false; scene.add(l); stringLines.push(l)
+    }
+
+    // Hand skeleton (21 landmarks)
+    const hp = new Float32Array(21*3)
+    const handLine = new THREE.Line(
+      new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(hp,3)),
+      new THREE.LineBasicMaterial({color:0x00ffaa})
+    )
+    handLine.visible = false; scene.add(handLine)
+
+    // Bone pairs
+    const bones = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[12,13],[13,14],[14,15],[15,16],[12,17],[17,18],[18,19],[19,20],[5,9],[9,13],[13,17]]
+    const bp = []
+    for (const [a,b] of bones) { bp.push(hp[a*3],hp[a*3+1],hp[a*3+2],hp[b*3],hp[b*3+1],hp[b*3+2]) }
+    const boneLine = new THREE.LineSegments(
+      new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute(bp,3)),
+      new THREE.LineBasicMaterial({color:0x00aa66, transparent:true, opacity:0.5})
+    )
+    boneLine.visible = false; scene.add(boneLine)
 
     // ── Mouse controls ───────────────────────────────────────────────────────
     const canvas = document.getElementById('canvas')
@@ -182,64 +181,67 @@
       renderer.setSize(innerWidth, innerHeight)
     })
 
-    // ── Camera + MediaPipe ───────────────────────────────────────────────────
+    // ── Camera + MediaPipe (with heavy error handling) ──────────────────────
     const video = document.getElementById('video')
-    let mediaPipeReady = false
+    let mpLoaded = false
 
-    async function start() {
+    async function initCamera() {
       try {
-        initThree()
-        STATUS_EL.textContent = 'Starting camera...'
-
         const stream = await navigator.mediaDevices.getUserMedia({
           video: { width:{ideal:CAM_W}, height:{ideal:CAM_H}, facingMode:'user' }
         })
         video.srcObject = stream
         await video.play()
-        STATUS_EL.textContent = 'Starting MediaPipe...'
+        return true
+      } catch(e) {
+        console.warn('[handtrack] camera failed:', e.message)
+        return false
+      }
+    }
 
+    async function loadMediaPipe() {
+      // Try loading MediaPipe Hands
+      try {
+        // Dynamic import from CDN
+        const handsModule = await import('https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/+esm')
+        const cameraModule = await import('https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1675466862/+esm')
+        
+        const Hands = handsModule.Hands
+        const Camera = cameraModule.Camera
+        
         const hands = new Hands({
-          locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${f}`
+          locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`
         })
         hands.setOptions({ maxNumHands:1, modelComplexity:1, minDetectionConfidence:0.5, minTrackingConfidence:0.5 })
         hands.onResults(onResults)
-
-        // Use requestAnimationFrame loop instead of Camera class for more control
-        mediaPipeReady = true
-        LOADING_EL.style.display = 'none'
-        STATUS_EL.textContent = 'AI AGENT: ACTIVE'
-        STATUS_EL.className = 'status'
-        requestAnimationFrame(loop)
-
+        
+        mpLoaded = true
+        return hands
       } catch(e) {
-        console.error(e)
-        LOADING_EL.style.display = 'none'
-        if (e.name === 'NotAllowedError') {
-          STATUS_EL.textContent = 'CAMERA DENIED - allow in browser settings'
-          STATUS_EL.className = 'status off'
-          showError('Camera access denied. Please allow camera permission.')
-        } else if (e.name === 'NotFoundError') {
-          STATUS_EL.textContent = 'NO CAMERA FOUND'
-          STATUS_EL.className = 'status off'
-          showError('No webcam detected.')
-        } else {
-          STATUS_EL.textContent = 'ERROR: ' + e.message
-          STATUS_EL.className = 'status off'
-          showError(e.message)
-        }
+        console.error('[handtrack] MediaPipe load failed:', e)
+        return null
       }
     }
 
     function onResults(results) {
-      if (!results.multiHandLandmarks || !results.multiHandLandmarks.length) {
-        handLine.visible = false; boneLine.visible = false
+      if (!results || !results.multiHandLandmarks || !results.multiHandLandmarks.length) {
+        handLine.visible = false
+        boneLine.visible = false
         for (const l of stringLines) l.visible = false
+        handDetected = false
+        STATUS_EL.textContent = 'AI AGENT: STANDBY'
+        STATUS_EL.style.color = '#f80'
         return
       }
-      const lm = results.multiHandLandmarks[0]
-      handLine.visible = true; boneLine.visible = true
 
-      const hp = handLine.geometry.attributes.position.array
+      handDetected = true
+      const lm = results.multiHandLandmarks[0]
+      handLine.visible = true
+      boneLine.visible = true
+      STATUS_EL.textContent = 'AI AGENT: ACTIVE'
+      STATUS_EL.style.color = '#0f8'
+
+      // Update hand skeleton
       for (let i = 0; i < 21; i++) {
         hp[i*3]=(0.5-lm[i].x)*4; hp[i*3+1]=(0.5-lm[i].y)*3; hp[i*3+2]=-lm[i].z*2
       }
@@ -262,12 +264,13 @@
     }
 
     // ── Animation loop ───────────────────────────────────────────────────────
+    const clock = new THREE.Clock()
     let fpsCnt=0, fpsTime=0, currentFps=0
 
-    function loop() {
-      requestAnimationFrame(loop)
-      const dt = clock ? clock.getDelta() : 0.016
-      const t = clock ? clock.getElapsedTime() : 0
+    function animate() {
+      requestAnimationFrame(animate)
+      const dt = clock.getDelta()
+      const t = clock.getElapsedTime()
 
       // FPS
       fpsCnt++; fpsTime += dt
@@ -279,11 +282,61 @@
         robotMeshes[k].position.y = b[1] + Math.sin(t*0.8+b[1]*2)*0.05
       }
 
+      // Demo mode: show dummy hand if no camera
+      if (!handDetected && mpLoaded) {
+        // Animate a dummy hand for demo
+        const demoTime = t * 2
+        for (let i = 0; i < 21; i++) {
+          hp[i*3] = Math.sin(demoTime + i*0.3) * 1.5
+          hp[i*3+1] = Math.cos(demoTime + i*0.2) * 1.0 + 0.5
+          hp[i*3+2] = Math.sin(demoTime + i*0.1) * 0.5
+        }
+        handLine.geometry.attributes.position.needsUpdate = true
+        handLine.visible = true
+        boneLine.visible = true
+      }
+
       renderer.render(scene, camera)
     }
 
-    // Start after libs load
-    clock = new THREE.Clock()
+    // ── Start ────────────────────────────────────────────────────────────────
+    async function start() {
+      STATUS_EL.textContent = 'Loading...'
+      
+      // Try camera first
+      const camOk = await initCamera()
+      if (!camOk) {
+        STATUS_EL.textContent = 'NO CAMERA'
+        STATUS_EL.style.color = '#f80'
+        FALLBACK_EL.style.display = 'block'
+      }
+
+      // Try MediaPipe
+      const hands = await loadMediaPipe()
+      if (hands && camOk) {
+        // Start processing frames
+        async function processFrame() {
+          if (video.readyState >= 2) {
+            try {
+              await hands.send({image: video})
+            } catch(e) {
+              console.error('[handtrack] send failed:', e)
+            }
+          }
+          requestAnimationFrame(processFrame)
+        }
+        processFrame()
+        STATUS_EL.textContent = 'AI AGENT: ACTIVE'
+      } else {
+        // Demo mode with animated hand
+        mpLoaded = true
+        STATUS_EL.textContent = 'DEMO MODE (no camera)'
+        STATUS_EL.style.color = '#888'
+      }
+
+      animate()
+    }
+
     start()
   </script>
 </body>
