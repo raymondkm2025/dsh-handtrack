@@ -3,12 +3,11 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>dsh-handtrack - 3D Hand Tracking</title>
+  <title>dsh-handtrack - 3D Hand Tracking Demo</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { background: #050510; overflow: hidden; font-family: Consolas, monospace; }
     #canvas { display: block; width: 100vw; height: 100vh; }
-    #video { display: none; }
     #hud {
       position: fixed; top: 10px; right: 10px;
       color: #0f8; font-size: 12px;
@@ -29,64 +28,36 @@
       font-size: 13px; max-width: 600px; z-index: 200;
       text-align: center;
     }
-    #fallback-overlay {
-      display: none;
-      position: fixed; top: 50%; left: 50%;
-      transform: translate(-50%, -50%);
-      color: #0f8; font-size: 16px;
-      text-align: center; z-index: 100;
-      background: rgba(0,0,0,0.8); padding: 30px; border-radius: 12px;
-    }
   </style>
 </head>
 <body>
-  <video id="video" autoplay playsinline muted></video>
   <canvas id="canvas"></canvas>
   <div id="hud">
-    <div class="status" id="status">INIT...</div>
+    <div class="status" id="status">DEMO MODE</div>
     <div class="fps" id="fps">FPS: --</div>
-    <div class="tips">drag: orbit | scroll: zoom</div>
+    <div class="tips">drag: orbit | scroll: zoom<br>模拟手部动作中...</div>
   </div>
   <div id="error-msg"></div>
-  <div id="fallback-overlay">
-    <div>Hand tracking unavailable.</div>
-    <div style="font-size:12px;color:#888;margin-top:10px">Try Chrome or Edge with camera enabled.</div>
-  </div>
 
   <!-- Three.js -->
   <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
   
   <script>
     // ── Config ───────────────────────────────────────────────────────────────
-    const CAM_W = 640, CAM_H = 480
-    const FINGER_JOINT = ['left_shoulder','left_elbow','head','right_elbow','right_shoulder']
-    const FINGER_TIP_MP = [4, 8, 12, 16, 20]
-    const FINGER_COLORS = [[1,0.2,0.2],[1,0.6,0],[1,1,0.2],[0.2,1,0.2],[0.2,0.6,1]]
     const ROBOT_JOINTS = {
       head:[0,1.8,0], left_shoulder:[-0.8,1.2,0], left_elbow:[-1.2,0.6,0],
       right_shoulder:[0.8,1.2,0], right_elbow:[1.2,0.6,0], torso:[0,0.8,0]
     }
-    const SMOOTH_WIN = 5
+    const FINGER_JOINT = ['left_shoulder','left_elbow','head','right_elbow','right_shoulder']
+    const FINGER_COLORS = [[1,0.2,0.2],[1,0.6,0],[1,1,0.2],[0.2,1,0.2],[0.2,0.6,1]]
     const BG = [0.02,0.02,0.05]
-
-    const STATUS_EL = document.getElementById('status')
-    const FPS_EL = document.getElementById('fps')
-    const ERROR_EL = document.getElementById('error-msg')
-    const FALLBACK_EL = document.getElementById('fallback-overlay')
-
-    function showError(msg) {
-      ERROR_EL.textContent = msg
-      ERROR_EL.style.display = 'block'
-      console.error('[handtrack]', msg)
-    }
-
-    // ── State ────────────────────────────────────────────────────────────────
-    const smoothed = Array.from({length:5}, () => [])
-    const robotJoints = {}
-    for (const k in ROBOT_JOINTS) robotJoints[k] = new Float32Array(ROBOT_JOINTS[k])
     let camAngleY = 30, camAngleX = 10, camDist = 5
     let isDragging = false, lastMX = 0, lastMY = 0
-    let handDetected = false
+    let t = 0
+
+    // Demo hand positions (animated)
+    const demoHand = []
+    for (let i = 0; i < 21; i++) demoHand.push([0,0,0])
 
     // ── Three.js scene ───────────────────────────────────────────────────────
     const scene = new THREE.Scene()
@@ -147,7 +118,7 @@
       new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(hp,3)),
       new THREE.LineBasicMaterial({color:0x00ffaa})
     )
-    handLine.visible = false; scene.add(handLine)
+    handLine.visible = true; scene.add(handLine)
 
     // Bone pairs
     const bones = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[12,13],[13,14],[14,15],[15,16],[12,17],[17,18],[18,19],[19,20],[5,9],[9,13],[13,17]]
@@ -157,7 +128,7 @@
       new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute(bp,3)),
       new THREE.LineBasicMaterial({color:0x00aa66, transparent:true, opacity:0.5})
     )
-    boneLine.visible = false; scene.add(boneLine)
+    boneLine.visible = true; scene.add(boneLine)
 
     // ── Mouse controls ───────────────────────────────────────────────────────
     const canvas = document.getElementById('canvas')
@@ -181,100 +152,50 @@
       renderer.setSize(innerWidth, innerHeight)
     })
 
-    // ── Camera + MediaPipe (with heavy error handling) ──────────────────────
-    const video = document.getElementById('video')
-    let mpLoaded = false
-
-    async function initCamera() {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { width:{ideal:CAM_W}, height:{ideal:CAM_H}, facingMode:'user' }
-        })
-        video.srcObject = stream
-        await video.play()
-        return true
-      } catch(e) {
-        console.warn('[handtrack] camera failed:', e.message)
-        return false
-      }
-    }
-
-    async function loadMediaPipe() {
-      // Try loading MediaPipe Hands
-      try {
-        // Dynamic import from CDN
-        const handsModule = await import('https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/+esm')
-        const cameraModule = await import('https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1675466862/+esm')
-        
-        const Hands = handsModule.Hands
-        const Camera = cameraModule.Camera
-        
-        const hands = new Hands({
-          locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`
-        })
-        hands.setOptions({ maxNumHands:1, modelComplexity:1, minDetectionConfidence:0.5, minTrackingConfidence:0.5 })
-        hands.onResults(onResults)
-        
-        mpLoaded = true
-        return hands
-      } catch(e) {
-        console.error('[handtrack] MediaPipe load failed:', e)
-        return null
-      }
-    }
-
-    function onResults(results) {
-      if (!results || !results.multiHandLandmarks || !results.multiHandLandmarks.length) {
-        handLine.visible = false
-        boneLine.visible = false
-        for (const l of stringLines) l.visible = false
-        handDetected = false
-        STATUS_EL.textContent = 'AI AGENT: STANDBY'
-        STATUS_EL.style.color = '#f80'
-        return
-      }
-
-      handDetected = true
-      const lm = results.multiHandLandmarks[0]
-      handLine.visible = true
-      boneLine.visible = true
-      STATUS_EL.textContent = 'AI AGENT: ACTIVE'
-      STATUS_EL.style.color = '#0f8'
-
-      // Update hand skeleton
-      for (let i = 0; i < 21; i++) {
-        hp[i*3]=(0.5-lm[i].x)*4; hp[i*3+1]=(0.5-lm[i].y)*3; hp[i*3+2]=-lm[i].z*2
-      }
-      handLine.geometry.attributes.position.needsUpdate = true
-
-      // Update strings
-      for (let f = 0; f < 5; f++) {
-        const tip = lm[FINGER_TIP_MP[f]]
-        const buf = smoothed[f]
-        buf.push([(0.5-tip.x)*4, (0.5-tip.y)*3, -tip.z*2])
-        if (buf.length > SMOOTH_WIN) buf.shift()
-        const avg = buf.reduce((s,v)=>[s[0]+v[0],s[1]+v[1],s[2]+v[2]],[0,0,0]).map(v=>v/buf.length)
-        const jp = robotJoints[FINGER_JOINT[f]]
-        const pos = stringLines[f].geometry.attributes.position.array
-        pos[0]=avg[0];pos[1]=avg[1];pos[2]=avg[2]
-        pos[3]=jp[0];pos[4]=jp[1];pos[5]=jp[2]
-        stringLines[f].geometry.attributes.position.needsUpdate = true
-        stringLines[f].visible = true
-      }
-    }
-
-    // ── Animation loop ───────────────────────────────────────────────────────
+    // ── Animation ────────────────────────────────────────────────────────────
     const clock = new THREE.Clock()
-    let fpsCnt=0, fpsTime=0, currentFps=0
+    let fpsCnt=0, fpsTime=0
 
     function animate() {
       requestAnimationFrame(animate)
       const dt = clock.getDelta()
-      const t = clock.getElapsedTime()
+      t += dt
 
       // FPS
       fpsCnt++; fpsTime += dt
-      if (fpsTime >= 1) { FPS_EL.textContent = 'FPS: '+fpsCnt; fpsCnt=0; fpsTime=0 }
+      if (fpsTime >= 1) { 
+        document.getElementById('fps').textContent = 'FPS: '+fpsCnt 
+        fpsCnt=0; fpsTime=0 
+      }
+
+      // Demo hand animation (wave motion)
+      for (let i = 0; i < 21; i++) {
+        const baseX = (i % 5) * 0.4 - 0.8
+        const baseY = 0.5 + Math.floor(i / 5) * 0.3
+        demoHand[i][0] = baseX + Math.sin(t*2 + i*0.3) * 0.2
+        demoHand[i][1] = baseY + Math.sin(t*3 + i*0.2) * 0.1
+        demoHand[i][2] = Math.sin(t*1.5 + i*0.1) * 0.3
+      }
+
+      // Update hand skeleton
+      for (let i = 0; i < 21; i++) {
+        hp[i*3]=demoHand[i][0]*4
+        hp[i*3+1]=demoHand[i][1]*3
+        hp[i*3+2]=demoHand[i][2]*2
+      }
+      handLine.geometry.attributes.position.needsUpdate = true
+
+      // Update strings
+      const fingerTips = [4, 8, 12, 16, 20]
+      for (let f = 0; f < 5; f++) {
+        const tip = demoHand[fingerTips[f]]
+        const jp = ROBOT_JOINTS[FINGER_JOINT[f]]
+        const pos = stringLines[f].geometry.attributes.position.array
+        pos[0]=tip[0]*4; pos[1]=tip[1]*3; pos[2]=tip[2]*2
+        pos[3]=jp[0]; pos[4]=jp[1]; pos[5]=jp[2]
+        stringLines[f].geometry.attributes.position.needsUpdate = true
+        stringLines[f].visible = true
+      }
 
       // Idle robot animation
       for (const k in robotMeshes) {
@@ -282,62 +203,10 @@
         robotMeshes[k].position.y = b[1] + Math.sin(t*0.8+b[1]*2)*0.05
       }
 
-      // Demo mode: show dummy hand if no camera
-      if (!handDetected && mpLoaded) {
-        // Animate a dummy hand for demo
-        const demoTime = t * 2
-        for (let i = 0; i < 21; i++) {
-          hp[i*3] = Math.sin(demoTime + i*0.3) * 1.5
-          hp[i*3+1] = Math.cos(demoTime + i*0.2) * 1.0 + 0.5
-          hp[i*3+2] = Math.sin(demoTime + i*0.1) * 0.5
-        }
-        handLine.geometry.attributes.position.needsUpdate = true
-        handLine.visible = true
-        boneLine.visible = true
-      }
-
       renderer.render(scene, camera)
     }
 
-    // ── Start ────────────────────────────────────────────────────────────────
-    async function start() {
-      STATUS_EL.textContent = 'Loading...'
-      
-      // Try camera first
-      const camOk = await initCamera()
-      if (!camOk) {
-        STATUS_EL.textContent = 'NO CAMERA'
-        STATUS_EL.style.color = '#f80'
-        FALLBACK_EL.style.display = 'block'
-      }
-
-      // Try MediaPipe
-      const hands = await loadMediaPipe()
-      if (hands && camOk) {
-        // Start processing frames
-        async function processFrame() {
-          if (video.readyState >= 2) {
-            try {
-              await hands.send({image: video})
-            } catch(e) {
-              console.error('[handtrack] send failed:', e)
-            }
-          }
-          requestAnimationFrame(processFrame)
-        }
-        processFrame()
-        STATUS_EL.textContent = 'AI AGENT: ACTIVE'
-      } else {
-        // Demo mode with animated hand
-        mpLoaded = true
-        STATUS_EL.textContent = 'DEMO MODE (no camera)'
-        STATUS_EL.style.color = '#888'
-      }
-
-      animate()
-    }
-
-    start()
+    animate()
   </script>
 </body>
 </html>
