@@ -6,31 +6,20 @@
   <title>dsh-handtrack - 3D Hand Tracking Test</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      background: #000;
-      overflow: hidden;
-      font-family: Consolas, monospace;
-    }
+    body { background: #000; overflow: hidden; font-family: Consolas, monospace; }
     #canvas { display: block; width: 100vw; height: 100vh; }
-    #video {
-      position: fixed; top: 10px; left: 10px;
-      width: 320px; height: 240px;
-      border-radius: 8px; opacity: 0.85;
-      z-index: 10; pointer-events: none;
-      transform: scaleX(-1);
-    }
+    #video { display: none; }
     #hud {
       position: fixed; top: 10px; right: 10px;
       color: #0f8; font-size: 13px;
       background: rgba(0,0,0,0.6);
       padding: 8px 12px; border-radius: 6px;
       z-index: 10; pointer-events: none;
-      text-align: right;
+      text-align: right; min-width: 200px;
     }
-    #hud .status { color: #0f8; font-weight: bold; }
-    #hud .status.off { color: #f33; }
+    #hud .status { font-weight: bold; }
     #hud .fps { color: #888; font-size: 11px; margin-top: 4px; }
-    #hud .tips { color: #aaa; font-size: 10px; margin-top: 8px; line-height: 1.5; }
+    #hud .tips { color: #aaa; font-size: 10px; margin-top: 8px; line-height: 1.6; }
     #loading {
       position: fixed; top: 50%; left: 50%;
       transform: translate(-50%, -50%);
@@ -39,21 +28,27 @@
     }
     #loading .dot { animation: blink 1s infinite; }
     @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
+    #error-box {
+      display: none;
+      position: fixed; bottom: 20px; left: 20px;
+      background: rgba(200,0,0,0.8); color: #fff;
+      padding: 12px 16px; border-radius: 8px;
+      font-size: 12px; max-width: 500px; z-index: 200;
+    }
   </style>
 </head>
 <body>
   <video id="video" autoplay playsinline></video>
   <canvas id="canvas"></canvas>
   <div id="hud">
-    <div class="status" id="status">INIT...</div>
+    <div class="status" id="status">LOADING...</div>
     <div class="fps" id="fps">FPS: --</div>
-    <div class="tips">drag: orbit | scroll: zoom</div>
+    <div class="tips">drag: orbit | scroll: zoom<br>needs webcam access</div>
   </div>
   <div id="loading">Loading Three.js + MediaPipe<span class="dot">...</span></div>
+  <div id="error-box"></div>
 
-  <!-- Three.js -->
   <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
-  <!-- MediaPipe Hands -->
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1675466862/camera_utils.js"></script>
 
@@ -63,183 +58,190 @@
     const CAM_W = 640, CAM_H = 480
     const FINGER_JOINT = ['left_shoulder','left_elbow','head','right_elbow','right_shoulder']
     const FINGER_TIP_MP = [4, 8, 12, 16, 20]
-    const FINGER_COLORS = [
-      [1.0,0.2,0.2],[1.0,0.6,0.0],[1.0,1.0,0.2],[0.2,1.0,0.2],[0.2,0.6,1.0]
-    ]
+    const FINGER_COLORS = [[1,0.2,0.2],[1,0.6,0],[1,1,0.2],[0.2,1,0.2],[0.2,0.6,1]]
     const ROBOT_JOINTS = {
-      head:        [0.0,  1.8, 0.0],
-      left_shoulder: [-0.8, 1.2, 0.0],
-      left_elbow:  [-1.2, 0.6, 0.0],
-      right_shoulder: [0.8, 1.2, 0.0],
-      right_elbow: [1.2,  0.6, 0.0],
-      torso:       [0.0,  0.8, 0.0],
+      head:[0,1.8,0], left_shoulder:[-0.8,1.2,0], left_elbow:[-1.2,0.6,0],
+      right_shoulder:[0.8,1.2,0], right_elbow:[1.2,0.6,0], torso:[0,0.8,0]
     }
     const SMOOTH_WIN = 5
-    const BG_COLOR = [0.02, 0.02, 0.05]
+    const BG = [0.02,0.02,0.05]
+    const STATUS_EL = document.getElementById('status')
+    const FPS_EL = document.getElementById('fps')
+    const LOADING_EL = document.getElementById('loading')
+    const ERROR_EL = document.getElementById('error-box')
+
+    function showError(msg) {
+      ERROR_EL.textContent = 'ERROR: ' + msg
+      ERROR_EL.style.display = 'block'
+      console.error('[handtrack]', msg)
+    }
 
     // ── State ────────────────────────────────────────────────────────────────
     const smoothed = Array.from({length:5}, () => [])
     const robotJoints = {}
     for (const k in ROBOT_JOINTS) robotJoints[k] = new Float32Array(ROBOT_JOINTS[k])
-
-    let cameraAngleY = 30, cameraAngleX = 10, cameraDist = 5
+    let camAngleY = 30, camAngleX = 10, camDist = 5
     let isDragging = false, lastMX = 0, lastMY = 0
 
     // ── Three.js scene ───────────────────────────────────────────────────────
-    const scene = new THREE.Scene()
-    scene.background = new THREE.Color(BG_COLOR[0], BG_COLOR[1], BG_COLOR[2])
-    scene.fog = new THREE.FogExp2(new THREE.Color(BG_COLOR[0], BG_COLOR[1], BG_COLOR[2]), 0.04)
+    let scene, camera, renderer, clock
+    let stringLines = [], handLine, boneLine
+    let robotMeshes = {}
 
-    const camera = new THREE.PerspectiveCamera(45, W / H, 0.1, 100)
-    const renderer = new THREE.WebGLRenderer({ antialias: true, canvas: document.getElementById('canvas') })
-    renderer.setSize(W, H)
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
+    function initThree() {
+      scene = new THREE.Scene()
+      scene.background = new THREE.Color(BG[0], BG[1], BG[2])
+      scene.fog = new THREE.FogExp2(new THREE.Color(BG[0], BG[1], BG[2]), 0.04)
 
-    function updateCameraPos() {
-      const radY = cameraAngleY * Math.PI / 180
-      const radX = cameraAngleX * Math.PI / 180
-      camera.position.set(
-        cameraDist * Math.sin(radY) * Math.cos(radX),
-        cameraDist * Math.sin(radX) + 1.0,
-        cameraDist * Math.cos(radY) * Math.cos(radX)
+      camera = new THREE.PerspectiveCamera(45, W/H, 0.1, 100)
+      renderer = new THREE.WebGLRenderer({ antialias: true, canvas: document.getElementById('canvas') })
+      renderer.setSize(W, H)
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
+
+      // Lights
+      scene.add(new THREE.AmbientLight(0x404060, 0.8))
+      const dir = new THREE.DirectionalLight(0xffffff, 1.2)
+      dir.position.set(3,5,4); scene.add(dir)
+      const rim = new THREE.PointLight(0x4488ff, 0.6, 10)
+      rim.position.set(-3,2,-2); scene.add(rim)
+
+      // Ground
+      const ground = new THREE.Mesh(
+        new THREE.PlaneGeometry(20,20),
+        new THREE.MeshStandardMaterial({color:0x111122, roughness:0.9})
       )
+      ground.rotation.x = -Math.PI/2; ground.position.y = -1
+      scene.add(ground)
+      const grid = new THREE.GridHelper(20,20,0x222244,0x111133)
+      grid.position.y = -0.99; scene.add(grid)
+
+      // Robot joints
+      const geo = new THREE.SphereGeometry(0.08, 16, 16)
+      const mat = new THREE.MeshStandardMaterial({color:0x4488ff, emissive:0x2244aa, emissiveIntensity:0.3})
+      for (const k in ROBOT_JOINTS) {
+        const m = new THREE.Mesh(geo, mat.clone())
+        m.position.set(...ROBOT_JOINTS[k])
+        scene.add(m); robotMeshes[k] = m
+      }
+
+      // String lines
+      for (let f = 0; f < 5; f++) {
+        const pts = new Float32Array(6)
+        const g = new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(pts, 3))
+        const c = FINGER_COLORS[f]
+        const l = new THREE.Line(g, new THREE.LineBasicMaterial({color: new THREE.Color(c[0],c[1],c[2]), transparent:true, opacity:0.7}))
+        l.visible = false; scene.add(l); stringLines.push(l)
+      }
+
+      // Hand skeleton
+      const hp = new Float32Array(21*3)
+      handLine = new THREE.Line(
+        new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(hp,3)),
+        new THREE.LineBasicMaterial({color:0x00ffaa})
+      )
+      handLine.visible = false; scene.add(handLine)
+
+      // Bone connections
+      const bones = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[12,13],[13,14],[14,15],[15,16],[12,17],[17,18],[18,19],[19,20],[5,9],[9,13],[13,17]]
+      const bp = []
+      for (const [a,b] of bones) { bp.push(hp[a*3],hp[a*3+1],hp[a*3+2],hp[b*3],hp[b*3+1],hp[b*3+2]) }
+      boneLine = new THREE.LineSegments(
+        new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute(bp,3)),
+        new THREE.LineBasicMaterial({color:0x00aa66, transparent:true, opacity:0.5})
+      )
+      boneLine.visible = false; scene.add(boneLine)
+
+      updateCam()
+    }
+
+    function updateCam() {
+      const ry = camAngleY*Math.PI/180, rx = camAngleX*Math.PI/180
+      camera.position.set(camDist*Math.sin(ry)*Math.cos(rx), camDist*Math.sin(rx)+1, camDist*Math.cos(ry)*Math.cos(rx))
       camera.lookAt(0, 0.5, 0)
     }
-    updateCameraPos()
-
-    // Lights
-    scene.add(new THREE.AmbientLight(0x404060, 0.8))
-    const dir = new THREE.DirectionalLight(0xffffff, 1.2)
-    dir.position.set(3, 5, 4)
-    scene.add(dir)
-    const rim = new THREE.PointLight(0x4488ff, 0.6, 10)
-    rim.position.set(-3, 2, -2)
-    scene.add(rim)
-
-    // Ground
-    const ground = new THREE.Mesh(
-      new THREE.PlaneGeometry(20, 20),
-      new THREE.MeshStandardMaterial({ color: 0x111122, roughness: 0.9 })
-    )
-    ground.rotation.x = -Math.PI / 2
-    ground.position.y = -1.0
-    scene.add(ground)
-    scene.add(new THREE.GridHelper(20, 20, 0x222244, 0x111133).translateY(-0.99))
-
-    // Robot joints
-    const sphereGeo = new THREE.SphereGeometry(0.08, 16, 16)
-    const bodyMat = new THREE.MeshStandardMaterial({ color: 0x4488ff, emissive: 0x2244aa, emissiveIntensity: 0.3 })
-    const robotMeshes = {}
-    for (const j in ROBOT_JOINTS) {
-      const m = new THREE.Mesh(sphereGeo, bodyMat.clone())
-      m.position.set(...ROBOT_JOINTS[j])
-      scene.add(m)
-      robotMeshes[j] = m
-    }
-
-    // String lines
-    const stringLines = []
-    for (let f = 0; f < 5; f++) {
-      const pts = new Float32Array(6)
-      const geo = new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(pts, 3))
-      const mat = new THREE.LineBasicMaterial({
-        color: new THREE.Color(FINGER_COLORS[f][0], FINGER_COLORS[f][1], FINGER_COLORS[f][2]),
-        transparent: true, opacity: 0.7
-      })
-      const ln = new THREE.Line(geo, mat)
-      ln.visible = false
-      scene.add(ln)
-      stringLines.push(ln)
-    }
-
-    // Hand skeleton
-    const handPoints = new Float32Array(21 * 3)
-    const handGeo = new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(handPoints, 3))
-    const handLine = new THREE.Line(handGeo, new THREE.LineBasicMaterial({ color: 0x00ffaa }))
-    handLine.visible = false
-    scene.add(handLine)
-
-    // Bone connections
-    const bonePairs = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[12,13],[13,14],[14,15],[15,16],[12,17],[17,18],[18,19],[19,20],[5,9],[9,13],[13,17]]
-    const boneGeo = new THREE.BufferGeometry().setFromPoints(bonePairs.map(([a,b]) => new THREE.Vector3(handPoints[a*3], handPoints[a*3+1], handPoints[a*3+2])))
-    const boneLine = new THREE.LineSegments(boneGeo, new THREE.LineBasicMaterial({ color: 0x00aa66, transparent: true, opacity: 0.5 }))
-    boneLine.visible = false
-    scene.add(boneLine)
 
     // ── Mouse controls ───────────────────────────────────────────────────────
     const canvas = document.getElementById('canvas')
-    canvas.addEventListener('mousedown', e => { isDragging = true; lastMX = e.clientX; lastMY = e.clientY })
-    canvas.addEventListener('mouseup', () => isDragging = false)
-    canvas.addEventListener('mouseleave', () => isDragging = false)
+    canvas.addEventListener('mousedown', e => { isDragging=true; lastMX=e.clientX; lastMY=e.clientY })
+    canvas.addEventListener('mouseup', () => isDragging=false)
+    canvas.addEventListener('mouseleave', () => isDragging=false)
     canvas.addEventListener('mousemove', e => {
       if (!isDragging) return
-      const dx = e.clientX - lastMX, dy = e.clientY - lastMY
-      cameraAngleY -= dx * 0.3
-      cameraAngleX = Math.max(-80, Math.min(80, cameraAngleX + dy * 0.3))
-      updateCameraPos()
-      lastMX = e.clientX; lastMY = e.clientY
+      camAngleY -= (e.clientX-lastMX)*0.3
+      camAngleX = Math.max(-80, Math.min(80, camAngleX+(e.clientY-lastMY)*0.3))
+      updateCam(); lastMX=e.clientX; lastMY=e.clientY
     })
     canvas.addEventListener('wheel', e => {
       e.preventDefault()
-      cameraDist = Math.max(2, Math.min(12, cameraDist + e.deltaY * 0.005))
-      updateCameraPos()
-    }, { passive: false })
-
+      camDist = Math.max(2, Math.min(12, camDist+e.deltaY*0.005))
+      updateCam()
+    }, {passive:false})
     window.addEventListener('resize', () => {
-      camera.aspect = window.innerWidth / window.innerHeight
+      camera.aspect = innerWidth/innerHeight
       camera.updateProjectionMatrix()
-      renderer.setSize(window.innerWidth, window.innerHeight)
+      renderer.setSize(innerWidth, innerHeight)
     })
 
-    // ── Camera ───────────────────────────────────────────────────────────────
+    // ── Camera + MediaPipe ───────────────────────────────────────────────────
     const video = document.getElementById('video')
-    const statusEl = document.getElementById('status')
-    const fpsEl = document.getElementById('fps')
-    const loadingEl = document.getElementById('loading')
+    let mediaPipeReady = false
 
-    let camReady = false
-    let fpsFrames = 0, fpsTime = 0
-
-    async function initCamera() {
+    async function start() {
       try {
+        initThree()
+        STATUS_EL.textContent = 'Starting camera...'
+
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: { width: CAM_W, height: CAM_H, facingMode: 'user' }
+          video: { width:{ideal:CAM_W}, height:{ideal:CAM_H}, facingMode:'user' }
         })
         video.srcObject = stream
-        camReady = true
-        statusEl.textContent = 'AI AGENT: ACTIVE'
-        statusEl.className = 'status'
-      } catch (err) {
-        console.warn('[handtrack] camera unavailable:', err.message)
-        statusEl.textContent = 'CAMERA: OFFLINE'
-        statusEl.className = 'status off'
+        await video.play()
+        STATUS_EL.textContent = 'Starting MediaPipe...'
+
+        const hands = new Hands({
+          locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${f}`
+        })
+        hands.setOptions({ maxNumHands:1, modelComplexity:1, minDetectionConfidence:0.5, minTrackingConfidence:0.5 })
+        hands.onResults(onResults)
+
+        // Use requestAnimationFrame loop instead of Camera class for more control
+        mediaPipeReady = true
+        LOADING_EL.style.display = 'none'
+        STATUS_EL.textContent = 'AI AGENT: ACTIVE'
+        STATUS_EL.className = 'status'
+        requestAnimationFrame(loop)
+
+      } catch(e) {
+        console.error(e)
+        LOADING_EL.style.display = 'none'
+        if (e.name === 'NotAllowedError') {
+          STATUS_EL.textContent = 'CAMERA DENIED - allow in browser settings'
+          STATUS_EL.className = 'status off'
+          showError('Camera access denied. Please allow camera permission.')
+        } else if (e.name === 'NotFoundError') {
+          STATUS_EL.textContent = 'NO CAMERA FOUND'
+          STATUS_EL.className = 'status off'
+          showError('No webcam detected.')
+        } else {
+          STATUS_EL.textContent = 'ERROR: ' + e.message
+          STATUS_EL.className = 'status off'
+          showError(e.message)
+        }
       }
     }
 
-    // ── MediaPipe Hands ──────────────────────────────────────────────────────
-    const hands = new Hands({
-      locateFile: file => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`
-    })
-    hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 })
-    hands.onResults(onHandResults)
-
-    function onHandResults(results) {
+    function onResults(results) {
       if (!results.multiHandLandmarks || !results.multiHandLandmarks.length) {
-        handLine.visible = false
-        boneLine.visible = false
-        for (const ln of stringLines) ln.visible = false
+        handLine.visible = false; boneLine.visible = false
+        for (const l of stringLines) l.visible = false
         return
       }
-
       const lm = results.multiHandLandmarks[0]
-      handLine.visible = true
-      boneLine.visible = true
+      handLine.visible = true; boneLine.visible = true
 
-      // Update hand skeleton points
+      const hp = handLine.geometry.attributes.position.array
       for (let i = 0; i < 21; i++) {
-        handPoints[i*3]   = (0.5 - lm[i].x) * 4.0
-        handPoints[i*3+1] = (0.5 - lm[i].y) * 3.0
-        handPoints[i*3+2] = -lm[i].z * 2.0
+        hp[i*3]=(0.5-lm[i].x)*4; hp[i*3+1]=(0.5-lm[i].y)*3; hp[i*3+2]=-lm[i].z*2
       }
       handLine.geometry.attributes.position.needsUpdate = true
 
@@ -247,60 +249,42 @@
       for (let f = 0; f < 5; f++) {
         const tip = lm[FINGER_TIP_MP[f]]
         const buf = smoothed[f]
-        buf.push([(0.5 - tip.x) * 4.0, (0.5 - tip.y) * 3.0, -tip.z * 2.0])
+        buf.push([(0.5-tip.x)*4, (0.5-tip.y)*3, -tip.z*2])
         if (buf.length > SMOOTH_WIN) buf.shift()
-        const avg = buf.reduce((s, v) => [s[0]+v[0], s[1]+v[1], s[2]+v[2]], [0,0,0]).map(v => v / buf.length)
-
+        const avg = buf.reduce((s,v)=>[s[0]+v[0],s[1]+v[1],s[2]+v[2]],[0,0,0]).map(v=>v/buf.length)
         const jp = robotJoints[FINGER_JOINT[f]]
         const pos = stringLines[f].geometry.attributes.position.array
-        pos[0]=avg[0]; pos[1]=avg[1]; pos[2]=avg[2]
-        pos[3]=jp[0]; pos[4]=jp[1]; pos[5]=jp[2]
+        pos[0]=avg[0];pos[1]=avg[1];pos[2]=avg[2]
+        pos[3]=jp[0];pos[4]=jp[1];pos[5]=jp[2]
         stringLines[f].geometry.attributes.position.needsUpdate = true
         stringLines[f].visible = true
       }
     }
 
     // ── Animation loop ───────────────────────────────────────────────────────
-    const clock = new THREE.Clock()
+    let fpsCnt=0, fpsTime=0, currentFps=0
 
-    function animate() {
-      requestAnimationFrame(animate)
-      const dt = clock.getDelta()
-      const t = clock.getElapsedTime()
+    function loop() {
+      requestAnimationFrame(loop)
+      const dt = clock ? clock.getDelta() : 0.016
+      const t = clock ? clock.getElapsedTime() : 0
 
-      // FPS counter
-      fpsFrames++; fpsTime += dt
-      if (fpsTime >= 1.0) { fpsEl.textContent = `FPS: ${fpsFrames}`; fpsFrames = 0; fpsTime = 0 }
+      // FPS
+      fpsCnt++; fpsTime += dt
+      if (fpsTime >= 1) { FPS_EL.textContent = 'FPS: '+fpsCnt; fpsCnt=0; fpsTime=0 }
 
       // Idle robot animation
       for (const k in robotMeshes) {
-        const base = ROBOT_JOINTS[k]
-        robotMeshes[k].position.y = base[1] + Math.sin(t * 0.8 + base[1] * 2) * 0.05
+        const b = ROBOT_JOINTS[k]
+        robotMeshes[k].position.y = b[1] + Math.sin(t*0.8+b[1]*2)*0.05
       }
 
       renderer.render(scene, camera)
     }
 
-    // ── Start ────────────────────────────────────────────────────────────────
-    Promise.all([initCamera(), hands.send({image: video})])
-      .then(() => {
-        loadingEl.style.display = 'none'
-        animate()
-
-        // Start camera processing
-        const cameraUtils = new Camera(video, {
-          onFrame: async () => {
-            await hands.send({image: video})
-          },
-          width: CAM_W,
-          height: CAM_H
-        })
-        cameraUtils.start()
-      })
-      .catch(err => {
-        console.error('[handtrack] init failed:', err)
-        loadingEl.textContent = 'ERROR: ' + err.message
-      })
+    // Start after libs load
+    clock = new THREE.Clock()
+    start()
   </script>
 </body>
 </html>
