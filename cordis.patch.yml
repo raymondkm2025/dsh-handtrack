@@ -1,0 +1,7 @@
+# dsh-handtrack bundle patch: inserts the hand-tracking plugin row into the web
+# profile roster. The node half (exports ".") is minimal — this plugin is mostly
+# browser-side. The dsh.client declaration loads the Three.js + MediaPipe
+# hand-tracking panel in the web GUI.
+- insert:
+    - id: handtrack
+      name: 'dsh-handtrack'

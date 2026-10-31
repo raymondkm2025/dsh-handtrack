@@ -1,0 +1,54 @@
+{
+  "name": "dsh-handtrack",
+  "version": "1.0.0",
+  "description": "3D hand-tracking puppet control for DSH - MediaPipe Hands + Three.js robot avatar with string connections",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "hand-tracking",
+    "mediapipe",
+    "threejs",
+    "gesture",
+    "3d",
+    "avatar"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/raymondkm2025/dsh-handtrack.git"
+  },
+  "homepage": "https://github.com/raymondkm2025/dsh-handtrack#readme",
+  "bugs": {
+    "url": "https://github.com/raymondkm2025/dsh-handtrack/issues"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "react": "^18.2.0"
+  }
+}
